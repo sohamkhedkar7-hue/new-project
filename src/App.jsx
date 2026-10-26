@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
 import {
-  Activity, AlertTriangle, ArrowRight, BadgeIndianRupee, BatteryCharging,
+  Activity, AlertTriangle, ArrowRight, BadgeIndianRupee, BatteryCharging, Bot,
   Check, ChevronDown, Clock3, CloudRain, Gauge, Leaf, MapPin, Navigation, Pause,
-  Play, Plus, RotateCcw, Save, Settings2, Truck, Zap,
+  Play, Plus, RotateCcw, RefreshCw, Download, Settings2, Sparkles, Truck, Zap,
 } from 'lucide-react';
 import {
   Bar, BarChart, CartesianGrid, Legend, ResponsiveContainer, Tooltip, XAxis, YAxis,
@@ -11,7 +11,7 @@ import L from 'leaflet';
 import { Circle, MapContainer, Marker, Polyline, Popup, TileLayer, useMapEvents } from 'react-leaflet';
 import { INITIAL_DELIVERIES, INITIAL_VEHICLES, WAREHOUSE } from './data';
 import { getInsights, optimizeRoutes, routePosition } from './optimizer';
-import { saveScenario, supabase } from './supabase';
+import { checkOllama, generateOllamaInsights, OLLAMA_MODEL } from './ollama';
 
 const INITIAL_CLIMATE = { traffic: 32, rain: 18, heat: 28 };
 const ROUTE_COLORS = ['#57dda2', '#80aaff', '#d5a2ff'];
@@ -76,7 +76,12 @@ export default function App() {
     { id: 2, time: '09:01', text: '8 deliveries assigned across 3 vehicles', type: 'neutral' },
   ]);
   const [notice, setNotice] = useState('');
-  const [saving, setSaving] = useState(false);
+  const [ollamaStatus, setOllamaStatus] = useState('checking');
+  const [ollamaStatusError, setOllamaStatusError] = useState('');
+  const [ollamaGenerationError, setOllamaGenerationError] = useState('');
+  const [ollamaLoading, setOllamaLoading] = useState(false);
+  const [ollamaResult, setOllamaResult] = useState(null);
+  const [ollamaModel, setOllamaModel] = useState(OLLAMA_MODEL);
 
   const activeDeliveries = useMemo(
     () => deliveries.slice(0, demand).filter((delivery) => delivery.status !== 'Completed'),
@@ -92,6 +97,54 @@ export default function App() {
   );
   const plan = mode === 'eco' ? eco : baseline;
   const progress = Math.min(1, elapsed / 90);
+  const ollamaScenario = useMemo(() => ({
+    area: 'Indiranagar, Bengaluru',
+    dataSource: 'Synthetic demo scenario; not live fleet, map, traffic, or weather telemetry.',
+    selectedPlan: mode,
+    climate: { ...climate, conditionsAreSynthetic: true },
+    pendingDeliveries: activeDeliveries.map(({ id, name, weight, priority, deadline }) => ({ id, name, weightKg: weight, priority, deadline })),
+    baseline: baseline.totals,
+    ecoOptimized: eco.totals,
+    selectedPlanRoutes: plan.routes.filter((route) => route.stops.length).map((route) => ({
+      vehicleId: route.vehicle.id,
+      vehicleType: route.vehicle.type,
+      capacityKg: route.vehicle.capacity,
+      electric: route.vehicle.electric,
+      stops: route.stops.map(({ id, name, weight, priority, deadline }) => ({ id, name, weightKg: weight, priority, deadline })),
+      distanceKm: Number(route.distance.toFixed(1)),
+      estimatedMinutes: Math.round(route.minutes),
+      estimatedFuelLitres: Number(route.fuel.toFixed(2)),
+      estimatedElectricityKwh: Number(route.electricEnergy.toFixed(2)),
+      estimatedTailpipeEmissionsKg: Number(route.emissions.toFixed(2)),
+    })),
+    unassignedDeliveryIds: plan.unassigned.map((delivery) => delivery.id),
+    assumptions: {
+      dispatchTime: '09:00',
+      nominalSpeedKph: 23,
+      fuelPricePerLitreINR: 96,
+      electricityPricePerKwhINR: 9,
+      electricGridEmissionsIncluded: false,
+    },
+  }), [mode, climate, activeDeliveries, baseline, eco, plan]);
+  const ollamaScenarioKey = JSON.stringify(ollamaScenario);
+  const currentOllamaInsights = ollamaResult?.scenarioKey === ollamaScenarioKey ? ollamaResult.insights : null;
+
+  useEffect(() => {
+    let mounted = true;
+    checkOllama().then(({ model }) => {
+      if (!mounted) return;
+      setOllamaModel(model);
+      setOllamaStatus('ready');
+      setOllamaStatusError('');
+    }).catch((error) => {
+      if (!mounted) return;
+      setOllamaStatus(error.message.includes('not installed') ? 'missing' : 'offline');
+      setOllamaStatusError(error.message);
+    });
+    return () => {
+      mounted = false;
+    };
+  }, []);
   const completedIds = useMemo(() => {
     if (!elapsed) return new Set(deliveries.filter((delivery) => delivery.status === 'Completed').map((delivery) => delivery.id));
     const done = new Set(deliveries.filter((delivery) => delivery.status === 'Completed').map((delivery) => delivery.id));
@@ -128,6 +181,35 @@ export default function App() {
     ].slice(0, 8));
   }
 
+  async function refreshOllamaStatus() {
+    setOllamaStatus('checking');
+    setOllamaStatusError('');
+    try {
+      const { model } = await checkOllama();
+      setOllamaModel(model);
+      setOllamaStatus('ready');
+    } catch (error) {
+      setOllamaStatus(error.message.includes('not installed') ? 'missing' : 'offline');
+      setOllamaStatusError(error.message);
+    }
+  }
+
+  async function askOllama() {
+    setOllamaLoading(true);
+    setOllamaGenerationError('');
+    try {
+      const insights = await generateOllamaInsights({ model: ollamaModel, scenario: ollamaScenario });
+      setOllamaResult({ insights, scenarioKey: ollamaScenarioKey });
+      setOllamaStatus('ready');
+      addEvent(`Local Ollama model ${ollamaModel} generated route insights`, 'success');
+    } catch (error) {
+      setOllamaGenerationError(error.message);
+      if (/Cannot reach Ollama|did not respond in time/i.test(error.message)) setOllamaStatus('offline');
+    } finally {
+      setOllamaLoading(false);
+    }
+  }
+
   function resetSimulation() {
     setRunning(false);
     setElapsed(0);
@@ -139,6 +221,8 @@ export default function App() {
     setSelectedDelivery(null);
     setDeliveries(INITIAL_DELIVERIES);
     setVehicles(INITIAL_VEHICLES);
+    setOllamaResult(null);
+    setOllamaGenerationError('');
     setEvents([{ id: Date.now(), time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }), text: 'Demo scenario reset to the 8-stop morning dispatch', type: 'success' }]);
     setNotice('');
   }
@@ -204,22 +288,26 @@ export default function App() {
     setVehicles((current) => current.map((vehicle) => vehicle.id === id ? { ...vehicle, [key]: !vehicle[key] } : vehicle));
   }
 
-  async function saveToSupabase() {
-    if (!supabase) {
-      setNotice('Demo mode: add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY to .env to enable cloud saves.');
-      return;
-    }
-    setSaving(true);
-    setNotice('');
-    try {
-      await saveScenario({ savedAt: new Date().toISOString(), mode, climate, deliveries, vehicles, baseline, eco, elapsed });
-      setNotice('Scenario saved to Supabase.');
-      addEvent('Scenario snapshot saved to Supabase', 'success');
-    } catch (error) {
-      setNotice(error.message);
-    } finally {
-      setSaving(false);
-    }
+  function downloadScenario() {
+    const snapshot = {
+      savedAt: new Date().toISOString(),
+      mode,
+      climate,
+      deliveries,
+      vehicles,
+      baseline,
+      eco,
+      elapsed,
+    };
+    const file = new Blob([JSON.stringify(snapshot, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(file);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `ecoroute-scenario-${new Date().toISOString().slice(0, 10)}.json`;
+    link.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    setNotice('Scenario downloaded as a JSON file.');
+    addEvent('Scenario snapshot downloaded to this device', 'success');
   }
 
   const chartData = [
@@ -259,8 +347,8 @@ export default function App() {
           <span className="topbar-muted">Indiranagar, Bengaluru</span>
         </div>
         <div className="topbar-actions">
-          <span className={`supabase-status ${supabase ? 'connected' : ''}`} title={supabase ? 'Supabase configured' : 'Local demo mode'}>
-            <span />{supabase ? 'SUPABASE CONNECTED' : 'LOCAL DEMO'}
+          <span className={`service-status ${ollamaStatus === 'ready' ? 'connected' : ''}`} title={ollamaStatus === 'ready' ? `Ollama connected: ${ollamaModel}` : 'Running with the rule-based insights fallback'}>
+            <span />{ollamaStatus === 'ready' ? 'OLLAMA CONNECTED' : 'RULE-BASED MODE'}
           </span>
           <button className="icon-button reset-button" onClick={resetSimulation} title="Reset simulation"><RotateCcw size={15} /><span>Reset</span></button>
         </div>
@@ -330,7 +418,7 @@ export default function App() {
         <section className="map-panel">
           <div className="map-heading">
             <div><span className="eyebrow">ROUTE VISUALIZATION <i className="synthetic-tag">OSM · SIMULATED CONDITIONS</i></span><h1>Greater Bengaluru <span>Dispatch map</span></h1></div>
-            <div className="map-heading-actions"><span className="map-area"><MapPin size={13} /> 12.97° N, 77.64° E</span><button className="save-button" onClick={saveToSupabase} disabled={saving}><Save size={14} /> {saving ? 'Saving…' : 'Save scenario'}</button></div>
+            <div className="map-heading-actions"><span className="map-area"><MapPin size={13} /> 12.97° N, 77.64° E</span><button className="save-button" onClick={downloadScenario}><Download size={14} /> Export scenario</button></div>
           </div>
           <div className="map-canvas">
             <MapContainer center={[12.965, 77.657]} zoom={12} scrollWheelZoom className="leaflet-map">
@@ -424,15 +512,58 @@ export default function App() {
           </section>
 
           <section className="panel-section insight-section">
-            <div className="section-heading"><div><span className="eyebrow">ROUTE INTELLIGENCE</span><h2>Why this plan?</h2></div><span className="rule-based-label">RULE-BASED</span></div>
-            <div className="insight-list">{insights.map((insight) => (
-              <article className="insight-card" key={insight.title}>
-                <span className="insight-icon">{insight.icon === 'leaf' ? <Leaf size={15} /> : insight.icon === 'cloud' ? <CloudRain size={15} /> : insight.icon === 'zap' ? <Zap size={15} /> : <Navigation size={15} />}</span>
-                <div><strong>{insight.title}</strong><p>{insight.text}</p></div>
-              </article>
-            ))}</div>
+            <div className="section-heading">
+              <div><span className="eyebrow">ROUTE INTELLIGENCE</span><h2>Why this plan?</h2></div>
+              <span className={`ollama-status ${ollamaStatus}`}><i />{ollamaStatus === 'checking' ? 'CHECKING' : ollamaStatus === 'ready' ? 'OLLAMA READY' : ollamaStatus === 'missing' ? 'MODEL MISSING' : 'OLLAMA OFFLINE'}</span>
+            </div>
+            <div className="ollama-controls">
+              <button className="ollama-generate-button" onClick={askOllama} disabled={ollamaStatus !== 'ready' || ollamaLoading}>
+                {ollamaLoading ? <RefreshCw size={14} className="spinning" /> : <Sparkles size={14} />}
+                {ollamaLoading ? 'Thinking locally…' : `Ask Ollama · ${ollamaModel}`}
+              </button>
+              <button className="small-icon-button ollama-refresh-button" onClick={refreshOllamaStatus} disabled={ollamaStatus === 'checking'} title="Check Ollama connection" aria-label="Check Ollama connection">
+                <RefreshCw size={14} className={ollamaStatus === 'checking' ? 'spinning' : ''} />
+              </button>
+            </div>
+            <p className="ollama-caption"><Bot size={12} /> Local model inference · scenario stays on this computer</p>
+            {ollamaStatusError && ollamaStatus !== 'ready' && (
+              <div className="ollama-message" role="status">{ollamaStatusError}</div>
+            )}
+            {ollamaGenerationError && (
+              <div className="ollama-message generation-error" role="status">{ollamaGenerationError} Showing rule-based recommendations instead.</div>
+            )}
+            {ollamaResult && !currentOllamaInsights && <p className="ollama-stale">Plan or conditions changed. Generate insights again to refresh the local model's analysis.</p>}
+            {currentOllamaInsights ? (
+              <>
+                <div className="insight-list ollama-insight-list">{currentOllamaInsights.map((insight, index) => (
+                  <article className="insight-card" key={`${index}-${insight.title}`}>
+                    <span className="insight-icon"><Sparkles size={15} /></span>
+                    <div><strong>{insight.title}</strong><p>{insight.text}</p></div>
+                  </article>
+                ))}</div>
+                <details className="fallback-insights">
+                  <summary>Show rule-based checks</summary>
+                  <div className="insight-list">{insights.map((insight) => (
+                    <article className="insight-card" key={insight.title}>
+                      <span className="insight-icon">{insight.icon === 'leaf' ? <Leaf size={15} /> : insight.icon === 'cloud' ? <CloudRain size={15} /> : insight.icon === 'zap' ? <Zap size={15} /> : <Navigation size={15} />}</span>
+                      <div><strong>{insight.title}</strong><p>{insight.text}</p></div>
+                    </article>
+                  ))}</div>
+                </details>
+              </>
+            ) : (
+              <>
+                <span className="rule-based-label fallback-label">RULE-BASED FALLBACK</span>
+                <div className="insight-list">{insights.map((insight) => (
+                  <article className="insight-card" key={insight.title}>
+                    <span className="insight-icon">{insight.icon === 'leaf' ? <Leaf size={15} /> : insight.icon === 'cloud' ? <CloudRain size={15} /> : insight.icon === 'zap' ? <Zap size={15} /> : <Navigation size={15} />}</span>
+                    <div><strong>{insight.title}</strong><p>{insight.text}</p></div>
+                  </article>
+                ))}</div>
+              </>
+            )}
           </section>
-          {notice && <div className={`notice ${notice.startsWith('Supabase') ? 'success' : ''}`} role="status">{notice}<button onClick={() => setNotice('')} aria-label="Dismiss message">×</button></div>}
+          {notice && <div className="notice success" role="status">{notice}<button onClick={() => setNotice('')} aria-label="Dismiss message">×</button></div>}
         </aside>
       </div>
 
@@ -464,7 +595,7 @@ export default function App() {
           <p className="chart-disclaimer">Each metric is indexed against its baseline (100 = baseline); use the comparison table for actual units. Fuel and emissions use declared per-km estimates, not live telemetry.</p>
         </div>
       </section>
-      <footer className="footer"><span><Leaf size={13} /> EcoRoute AI <i /> A hackathon demo for lower-carbon urban logistics</span><span>Not turn-by-turn navigation · Synthetic traffic and weather · {supabase ? 'Supabase persistence enabled' : 'Local-only demo data'}</span></footer>
+      <footer className="footer"><span><Leaf size={13} /> EcoRoute AI <i /> A hackathon demo for lower-carbon urban logistics</span><span>Not turn-by-turn navigation · Synthetic traffic and weather · Export saves to this device</span></footer>
     </main>
   );
 }

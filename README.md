@@ -1,25 +1,31 @@
-# EcoRoute AI — Climate-aware logistics simulation
+# EcoRoute AI — climate-aware logistics
 
-A runnable React/Vite hackathon demo for comparing conventional dispatch with a climate-aware delivery plan. It includes an interactive OpenStreetMap map, moving vehicle markers, a deterministic synthetic road network, delivery/vehicle controls, route metrics, rule-based explanations, and optional Supabase snapshot storage.
+A Vite/React logistics dashboard and a small FastAPI service for locally hosted Ollama inference. The frontend can run without a backend or model: route planning and rule-based insights work in local demo mode, and **Export scenario** downloads a JSON snapshot to your device.
 
-## Project structure
+## Project layout
 
 ```text
 .
-├── index.html
-├── package.json
-├── vite.config.js
-├── .env.example
+├── backend/
+│   ├── main.py              # Render FastAPI app and secured Ollama client
+│   ├── requirements.txt
+│   ├── .python-version
+│   └── test_main.py
+├── render.yaml              # Render Blueprint for the API service
+├── vercel.json              # Vite build settings and SPA fallback
 ├── src/
-│   ├── App.jsx          # Dashboard, map, controls and simulation state
-│   ├── data.js          # Reproducible Bengaluru demo scenario
-│   ├── main.jsx         # React entry point and global styles
-│   ├── optimizer.js     # Road graph, Dijkstra, fleet assignment and estimates
-│   ├── styles.css       # Responsive climate-tech dashboard styles
-│   └── supabase.js      # Optional scenario persistence
-└── supabase/
-    └── schema.sql       # Snapshot table and demo insert policy
+│   ├── App.jsx               # Interactive dashboard, map and simulation
+│   ├── data.js               # Reproducible Bengaluru demo dataset
+│   ├── main.jsx              # React entry point
+│   ├── ollama.js             # Local Vite-proxy / deployed API client
+│   ├── ollama.test.js        # Ollama client tests
+│   ├── optimizer.js          # Synthetic road graph and route optimizer
+│   ├── optimizer.test.js
+│   └── styles.css
+└── vite.config.js            # Local development proxy to Ollama
 ```
+
+**No Supabase is required.** The Render API provides Ollama connectivity only; this project does not store scenarios in a cloud database.
 
 ## Run locally
 
@@ -30,63 +36,105 @@ npm install
 npm run dev
 ```
 
-Open the local URL Vite prints (usually <http://localhost:5173>). No API key is needed for the demo. OpenStreetMap tiles need an internet connection; the route planner and controls continue to work if the map tile service is unavailable.
+Open the Vite URL, usually <http://localhost:5173>. Without `VITE_API_URL`, the dev server proxies `/ollama` to Ollama at `http://127.0.0.1:11434`. Start Ollama and pull a model, for example:
 
-Build and preview the production bundle:
+```bash
+ollama pull qwen3:8b
+```
+
+You can optionally copy `.env.example` to `.env` and set `VITE_OLLAMA_MODEL=qwen3:8b`. When unset, the app selects an installed local model. Restart Vite after editing `.env`.
 
 ```bash
 npm test
 npm run build
-npm run preview
 ```
 
-## Supabase connection
+## Deploy the frontend to Vercel and API to Render
 
-The app uses Supabase only for explicit scenario snapshot saves. Without configuration it stays in local demo mode; no data is sent to a backend.
+Push the project, including `backend/`, `render.yaml`, `vercel.json`, `package-lock.json`, and `package.json`, to a GitHub repository. Do not commit `.env` or API tokens.
 
-1. Create a Supabase project.
-2. In the Supabase SQL editor, run [`supabase/schema.sql`](./supabase/schema.sql).
-3. Copy `.env.example` to `.env` in the project root and set the browser-safe project URL and anon key:
+### 1. Deploy the FastAPI service to Render
 
-   ```dotenv
-   VITE_SUPABASE_URL=https://your-project.supabase.co
-   VITE_SUPABASE_ANON_KEY=your-public-anon-key
+1. Sign in to [Render](https://render.com/) and select **New → Blueprint**.
+2. Connect the GitHub repository containing this project and select it.
+3. Render reads the root `render.yaml` and creates the **ecoroute-api** web service with `backend/` as its root directory. The health check endpoint is `/health`.
+4. In the new service, open **Environment** and configure:
+   - `OLLAMA_BASE_URL`: **optional**, and only if you have an Ollama service reachable from Render. See [How to get an Ollama server URL](#how-to-get-an-ollama-server-url) below.
+   - `OLLAMA_MODEL`: the exact model name installed on that Ollama service, such as `qwen3:8b`. Leave unset to select the first installed model.
+   - `OLLAMA_API_KEY`: optional bearer token if your secured Ollama gateway expects `Authorization: Bearer <token>`. Never add this to Vercel or a `VITE_*` variable.
+5. Deploy. Confirm that `https://YOUR-RENDER-SERVICE.onrender.com/health` returns JSON with `"status":"ok"`.
+
+If you create the service manually instead of using the Blueprint, set:
+
+| Render setting | Value |
+|---|---|
+| Root directory | `backend` |
+| Runtime | Python |
+| Build command | `pip install -r requirements.txt` |
+| Start command | `uvicorn main:app --host 0.0.0.0 --port $PORT` |
+| Health check path | `/health` |
+
+The API health endpoint can pass even when Ollama is not configured. The dashboard then uses its built-in rule-based recommendations; check `https://YOUR-RENDER-SERVICE.onrender.com/api/ollama/status` to see whether a model is available.
+
+### 2. Deploy the Vite frontend to Vercel
+
+1. Sign in to [Vercel](https://vercel.com/), choose **Add New → Project**, and import the same GitHub repository.
+2. Keep the project **Root Directory** set to the repository root (`.`). Do not set it to `backend`.
+3. Use the Vite settings below (also provided by `vercel.json`):
+
+   | Vercel setting | Value |
+   |---|---|
+   | Framework preset | Vite |
+   | Build command | `npm run build` |
+   | Output directory | `dist` |
+   | Install command | `npm install` |
+
+4. In **Project → Settings → Environment Variables**, add:
+
+   ```text
+   VITE_API_URL = https://YOUR-RENDER-SERVICE.onrender.com
    ```
 
-4. Restart `npm run dev`. The header should say **SUPABASE CONNECTED**. Use **Save scenario** to store the current plan, climate controls, vehicles, and deliveries in `simulation_snapshots`.
+   Use the Render service's origin only: no trailing slash and no `/api` suffix.
+5. Deploy the frontend. Check that the dashboard loads and the Ollama status appears in the insights panel.
+6. Copy the exact Vercel origin (for example, `https://ecoroute-ai-yourname.vercel.app`) into Render's `FRONTEND_ORIGINS`. If you need Vercel preview deployments, add their exact origins as comma-separated values too. Save the variable and redeploy/restart the Render service.
+7. In the dashboard, refresh the Ollama connection. When a model is configured and reachable, select **Ask Ollama**. If not, the planner still works with rule-based recommendations.
 
-Only use the public anon key in a browser app—never put a service-role key in `VITE_*` variables. The included insert-only RLS policy is intentionally permissive for a throwaway hackathon demo and does not authenticate or isolate users. Replace it with authenticated-user policies before production use; configure retention and access controls for real delivery data.
+When updating environment variables, trigger a new Vercel deployment so the `VITE_API_URL` value is included in its build. The Vite configuration for local development does not run as a Vercel backend.
 
-## What the planner does
+## How to get an Ollama server URL
 
-- Creates a reproducible local road graph from a 7×7 grid across the Bengaluru demo area, with warehouse and delivery nodes connected to nearby road nodes. Grid links approximate road segments; they are not downloaded road geometry.
-- Uses Dijkstra's shortest path for each leg. The baseline minimizes synthetic road distance. The eco plan uses a generalized edge cost combining distance with traffic, rain, and heat penalties. The heavy-rain event also raises penalties on the synthetic east-side corridor, and severe congestion heavily penalizes a central road segment to make the reroute visible.
-- Uses a greedy next-stop heuristic for estimated travel time, distance, high-priority preference, and deadline lateness (assuming dispatch at 09:00). Fleet assignments balance proximity and vehicle utilization while respecting rated payload capacity; stops that cannot fit are explicitly flagged as unassigned.
-- Estimates travel time from route length at a 23 km/h nominal speed, adjusted per road segment by synthetic weather and traffic. Four service minutes are added per stop.
-- Estimates diesel/hybrid fuel from the vehicle's declared litres/km rate with simple load and rain multipliers. Estimated CO₂ uses declared per-km rates and the same multipliers. Electric vehicles use zero **tailpipe** emissions, while their electricity use and operating cost are shown separately; grid-generation emissions are excluded.
-- Estimates cost using ₹96/litre fuel, ₹9/kWh electricity, and a per-kilometre operating allowance. These are illustrative assumptions, not live prices.
-- Animates markers along the calculated path. The climate-event button changes the road-edge penalties and recomputes routes and estimates. The selected plan's line and live progress update together.
-- The insight panel is deterministic, explainable, rule-based text—not an AI model response. No AI API is configured or claimed.
+Render cannot reach `localhost` on your computer. A URL such as `http://127.0.0.1:11434` works only on the same machine running Ollama; entering your computer's home IP is not a reliable or secure substitute. Render cannot automatically install or access your local `qwen3:8b`.
 
-### Limitations and next steps
+You have three choices:
 
-- The local grid is a stand-in for a road network. Use a routing provider such as OSRM/GraphHopper and road/turn restrictions for real navigation.
-- The route sequence is a greedy heuristic, not a globally optimal vehicle-routing-with-time-windows solver. Deadlines influence preference but are not enforced as hard feasibility constraints.
-- Weather and traffic are synthetic sliders/zones; no live forecast, congestion, elevation, charging availability, or grid carbon intensity is fetched.
-- Fuel/emissions/cost factors are transparent demo assumptions and should be calibrated and validated for the fleet and region.
-- OpenStreetMap tile availability depends on the network and tile service usage policy. Use an appropriate hosted tile provider for production traffic.
-- Supabase storage is optional, snapshots are write-only in this demo, and the included anonymous insert policy is not production access control.
-- Production extensions: authenticated tenant-scoped persistence, provider-backed road graph, demand import, charge/fuel constraints, time-window feasibility, modelled grid emissions, and audited real-world fleet factors.
+1. **Deploy the frontend/API without live Ollama (simplest and free):** leave `OLLAMA_BASE_URL` and `OLLAMA_MODEL` unset on Render. Route planning, simulation, export, and rule-based insights work; the Ollama insight button is disabled until a model server is configured.
+2. **Use a hosted Ollama-compatible service:** create an account with a provider that supports the Ollama `/api/tags` and `/api/chat` API, create or select a model, and copy its private HTTPS **base URL**. Put that URL in Render's `OLLAMA_BASE_URL`, its exact model tag in `OLLAMA_MODEL`, and its token in `OLLAMA_API_KEY` if required. The base URL should be the API origin—not an `/api/chat` URL. Confirm the provider supports Ollama's JSON-format chat requests before subscribing.
+3. **Run Ollama on an always-on server you control:** provision a GPU machine or VM with enough RAM/VRAM for the chosen model, install Ollama, pull the model, and put a TLS-enabled reverse proxy with bearer-token authentication in front of it. Allow only the routes the app uses (`/api/tags` and `/api/chat`). Set the reverse proxy's HTTPS origin and token as Render's `OLLAMA_BASE_URL` and `OLLAMA_API_KEY`.
 
-## Problem statement and impact
+Do **not** expose Ollama's default port `11434` directly to the public internet, disable authentication, put a secret token in Vercel, or add it to a `VITE_*` variable. The Render API supports an optional bearer token, not Cloudflare Access service-token headers. If using a tunnel or gateway, configure it to accept bearer authentication or add a secure server-side adapter.
 
-Urban delivery dispatchers often plan around distance or delivery time alone, even when traffic and weather change the real cost and emissions of a route. EcoRoute AI makes the trade-offs visible: planners can compare a distance-first baseline with a climate-aware plan, see why a path changes, and observe estimated distance, time, energy, cost, and tailpipe emissions together. The demo's intended real-world impact is fewer avoidable vehicle kilometres and better use of efficient vehicles, without promising that every greener choice is faster or cheaper.
+Render's free web services can sleep when idle; the first API request may be delayed. A hosted Ollama server may also have model cold-start delays. Larger models need substantial memory and CPU/GPU; a basic free Render web service is not a practical Ollama model host.
 
-## Two-minute demo script
+## What the planner does and assumptions
 
-1. **0:00–0:20 — Set the scene.** Open the dashboard and point out the Indiranagar hub, eight stops, and three vehicles (electric, diesel, hybrid). Explain that traffic/weather and all cost/emissions figures are synthetic estimates.
-2. **0:20–0:40 — Show the baseline.** Select **Baseline** and click **Start simulation**. Show the dashed conventional route, moving vehicles, progress, and the baseline comparison values.
-3. **0:40–1:00 — Compare the eco plan.** Pause or reset, select **Eco-optimized**, then start. Explain that Dijkstra picks road-grid paths while a greedy stop order balances distance, time, and priority.
-4. **1:00–1:25 — Trigger a cause-and-effect event.** Click **Simulate climate event**. The first click introduces heavy rain plus traffic congestion; explain that new edge penalties trigger recalculation and change route geometry and estimates.
-5. **1:25–1:45 — Inspect the trade-off.** Compare time, kilometres, fuel, emissions, and rupee cost in the table/chart. Point out that the eco plan may not win every metric and that electricity grid emissions are excluded.
-6. **1:45–2:00 — Show extensibility.** Click the map to add a stop, adjust a climate slider or vehicle toggle, and show the plan update. If configured, use **Save scenario** to demonstrate Supabase; otherwise explain that local demo mode sends no data.
+- Builds a deterministic illustrative road grid around Bengaluru and runs Dijkstra's shortest-path search on its synthetic road links. It is not turn-by-turn road data.
+- Compares a distance-first baseline with a climate-aware plan whose edge costs include synthetic traffic, rain, and heat. Severe simulated rain/congestion penalizes selected links so route geometry can visibly change.
+- Assigns deliveries to available vehicles using a greedy proximity/capacity heuristic and considers delivery priority and lateness in the stop order. It is not a global vehicle-routing solver; capacity overflow is reported.
+- Estimates travel time at a nominal 23 km/h plus simulated congestion/weather effects and four service minutes per stop.
+- Estimates fuel, electricity, tailpipe CO₂, and cost using the documented per-vehicle rates and illustrative ₹96/litre, ₹9/kWh, and per-kilometre cost assumptions. Electric grid emissions are excluded. These are not live telemetry or current quotes.
+- AI-generated text comes from the configured Ollama model; it does not modify route calculations. The planner's deterministic rules remain available as fallback. Model output can be mistaken, so compare it with the calculated metrics.
+
+## Limitations and future improvements
+
+- Replace the synthetic graph with a supported road routing provider before operational use.
+- Add a real vehicle-routing solver with hard delivery windows, load dimensions, charging/fuelling, and shift constraints.
+- Add authenticated user accounts and a proper database only if persistent, multi-user scenarios are needed.
+- Calibrate vehicle emissions, electricity-grid factors, fuel use, weather, traffic, and operating prices with locally validated data.
+- The deployed Ollama API must be private/authenticated and reachable over HTTPS; serverless frontend code cannot access the user's local Ollama instance.
+
+## Problem statement, impact, and demo
+
+EcoRoute makes route trade-offs visible: dispatchers can compare distance, time, energy, cost, and tailpipe emissions while watching simulated vehicles respond to changed road conditions. It aims to demonstrate fewer avoidable kilometres and more efficient vehicle use without promising that a lower-emission route is always faster or cheaper.
+
+**Two-minute demo:** (1) Show the three vehicles and eight stops. (2) Run the baseline and watch the map. (3) Switch to the eco plan and compare estimates. (4) Trigger the heavy-rain/traffic event and point out the recalculated paths and metrics. (5) Click **Ask Ollama** if the remote model is configured; otherwise show the labelled rule-based fallback. (6) Optionally add a stop on the map and export the scenario JSON.
